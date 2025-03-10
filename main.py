@@ -15,22 +15,29 @@ def get_kline_data(symbol="BTCUSDT", interval="1m", limit=100):
     url = f"{MEXC_BASE_URL}/klines?symbol={symbol}&interval={interval}&limit={limit}"
     try:
         response = requests.get(url)
-        response.raise_for_status()  # Raises error for bad HTTP responses
+        response.raise_for_status()  # Raises an error for bad HTTP responses
+
         data = response.json()
-        
         if not data:
             print("❌ Error: API returned empty data")
             return None
-        
-        # Extract number of columns from API response
-        column_count = len(data[0])
-        expected_columns = ["timestamp", "open", "high", "low", "close", "volume"]
-        all_columns = expected_columns[:column_count]  # Adjust to match API response
-        
-        df = pd.DataFrame(data, columns=all_columns)
+
+        # Adjusted column names to match MEXC response
+        column_names = ["timestamp", "open", "high", "low", "close", "volume", "close_timestamp", "quote_asset_volume"]
+
+        # Convert data to DataFrame
+        df = pd.DataFrame(data, columns=column_names)
+
+        # Convert necessary columns to correct types
         df["close"] = df["close"].astype(float)
+        df["open"] = df["open"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+        df["volume"] = df["volume"].astype(float)
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+
         return df
+
     except requests.exceptions.RequestException as e:
         print(f"❌ API Request Failed: {e}")
         return None
@@ -64,11 +71,11 @@ def check_trade_signals(df):
     elif latest["rsi"] < 30:
         signals.append("RSI Oversold - Potential Buy Signal")
     
-    if "upper_band" in df.columns and latest["close"] >= latest["upper_band"]:
+    if latest["close"] >= latest["upper_band"]:
         signals.append("Price hit upper Bollinger Band - Possible Reversal Down")
-    if "lower_band" in df.columns and latest["close"] <= latest["lower_band"]:
+    elif latest["close"] <= latest["lower_band"]:
         signals.append("Price hit lower Bollinger Band - Possible Reversal Up")
-    
+
     return signals
 
 # Main function to run the bot
