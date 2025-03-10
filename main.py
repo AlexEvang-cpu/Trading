@@ -48,10 +48,28 @@ def get_kline_data(symbol="BTCUSDT", interval="1m", limit=100):
 # Function to calculate Bollinger Bands and RSI
 def calculate_indicators(df):
     try:
+        print("✅ Checking DataFrame before applying indicators:")
+        print(df.head())  # Debugging: Show first few rows
+
+        if "close" not in df.columns:
+            print("❌ Error: 'close' column missing in DataFrame")
+            return None
+
+        # Ensure close price is float
+        df["close"] = df["close"].astype(float)
+
+        # Calculate indicators
         df["rsi"] = df["close"].ta.rsi(length=14)
         bbands = df["close"].ta.bbands(length=20)
+
+        if bbands is None or "BBU_20_2.0" not in bbands.columns or "BBL_20_2.0" not in bbands.columns:
+            print("❌ Error: Bollinger Bands calculation failed")
+            return None
+
         df["upper_band"] = bbands["BBU_20_2.0"]
         df["lower_band"] = bbands["BBL_20_2.0"]
+
+        print("✅ Successfully calculated indicators")
         return df
     except Exception as e:
         print(f"❌ Error calculating indicators: {e}")
