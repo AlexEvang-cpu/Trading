@@ -1,6 +1,6 @@
 import requests
 import pandas as pd
-import talib as ta
+import pandas_ta as ta
 import time
 from flask import Flask
 
@@ -24,9 +24,10 @@ def get_kline_data(symbol="BTCUSDT", interval="1m", limit=100):
 
 # Function to calculate Bollinger Bands and RSI
 def calculate_indicators(df):
-    df["rsi"] = ta.RSI(df["close"], timeperiod=14)
-    upper_band, middle_band, lower_band = ta.BBANDS(df["close"], timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
-    df["upper_band"], df["lower_band"] = upper_band, lower_band
+    df["rsi"] = df["close"].ta.rsi(length=14)
+    bbands = df["close"].ta.bbands(length=20)
+    df["upper_band"] = bbands["BBU_20_2.0"]
+    df["lower_band"] = bbands["BBL_20_2.0"]
     return df
 
 # Function to detect trade signals
@@ -59,4 +60,3 @@ def run_bot():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
-
