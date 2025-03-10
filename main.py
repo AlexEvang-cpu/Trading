@@ -58,13 +58,26 @@ def calculate_indicators(df):
         # Ensure close price is float
         df["close"] = df["close"].astype(float)
 
-        # Calculate indicators
-        df["rsi"] = df["close"].ta.rsi(length=14)
-        bbands = df["close"].ta.bbands(length=20)
+        # Calculate RSI
+        if not df["close"].isnull().values.any():
+            df["rsi"] = ta.rsi(df["close"], length=14)
+        else:
+            print("❌ Error: 'close' column contains NaN values")
+            return None
 
-        if bbands is None or "BBU_20_2.0" not in bbands.columns or "BBL_20_2.0" not in bbands.columns:
+        # Calculate Bollinger Bands
+        bbands = ta.bbands(df["close"], length=20)
+        
+        if bbands is None:
             print("❌ Error: Bollinger Bands calculation failed")
             return None
+
+        # Ensure BBANDS keys exist
+        expected_keys = ["BBL_20_2.0", "BBU_20_2.0"]
+        for key in expected_keys:
+            if key not in bbands.columns:
+                print(f"❌ Error: Missing column {key} in Bollinger Bands")
+                return None
 
         df["upper_band"] = bbands["BBU_20_2.0"]
         df["lower_band"] = bbands["BBL_20_2.0"]
