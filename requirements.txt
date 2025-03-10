@@ -1,6 +1,6 @@
 Flask
 pandas
 requests
-TA-Lib
+pandas_ta
 numpy
 gunicorn
