@@ -14,12 +14,24 @@ app = Flask(__name__)
 def get_kline_data(symbol="BTCUSDT", interval="1m", limit=100):
     url = f"{MEXC_BASE_URL}/klines?symbol={symbol}&interval={interval}&limit={limit}"
     response = requests.get(url)
+    
     if response.status_code == 200:
         data = response.json()
-        df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume", "_", "_", "_", "_", "_", "_"])
+        
+        # Expected columns
+        expected_columns = ["timestamp", "open", "high", "low", "close", "volume"]
+        extra_columns = len(data[0]) - len(expected_columns)  # Get number of extra columns
+        
+        # Generate correct column names dynamically
+        all_columns = expected_columns + [f"extra_{i}" for i in range(extra_columns)]
+        
+        df = pd.DataFrame(data, columns=all_columns)
+        
         df["close"] = df["close"].astype(float)
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         return df
+    
+    print("Error fetching data:", response.text)
     return None
 
 # Function to calculate Bollinger Bands and RSI
