@@ -2,3 +2,5 @@ Flask
 pandas
 requests
 TA-Lib
+numpy
+gunicorn
