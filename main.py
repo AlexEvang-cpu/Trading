@@ -2,259 +2,230 @@ import os
 import requests
 import pandas as pd
 import pandas_ta as ta
+import numpy as np
 import traceback
 from flask import Flask, jsonify
 from datetime import datetime
+from joblib import load
 
 # Configuration
 MEXC_FUTURES_BASE_URL = "https://contract.mexc.com/api/v1/contract"
 DEFAULT_SYMBOL = os.getenv("TRADING_SYMBOL", "BTC_USDT")
-DEFAULT_INTERVAL = os.getenv("TRADING_INTERVAL", "Min1")
-DEFAULT_LIMIT = int(os.getenv("DATA_LIMIT", "300"))
+DEFAULT_INTERVAL = os.getenv("TRADING_INTERVAL", "Min1")  # 1-minute timeframe
+DEFAULT_LIMIT = int(os.getenv("DATA_LIMIT", "300"))       # 5 hours of data
+MODEL_PATH = os.getenv("MODEL_PATH", "price_model.joblib")
 
 app = Flask(__name__)
-app.logger.setLevel('DEBUG')  # Enable verbose logging
+app.logger.setLevel('DEBUG')
 
-def log_step(step, message, data=None):
-    """Uniform logging format for debugging"""
-    app.logger.debug(f"[{step}] {message}")
+# ML Initialization
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    ML_ENABLED = True
+except ImportError:
+    ML_ENABLED = False
+    app.logger.warning("ML features disabled - scikit-learn not installed")
+
+model = load(MODEL_PATH) if ML_ENABLED and os.path.exists(MODEL_PATH) else None
+
+def log_step(step, message, data=None, level='debug'):
+    """Structured logging with data sanitization"""
+    logger = getattr(app.logger, level)
+    log_msg = f"[{step}] {message}"
     if data is not None:
-        app.logger.debug(f"[{step}] Data: {str(data)[:200]}...")  # Limit data length
+        sanitized = str(data).replace('\n', ' ')[:200]
+        log_msg += f" | Data: {sanitized}"
+    logger(log_msg)
 
 def get_futures_kline(symbol=DEFAULT_SYMBOL, interval=DEFAULT_INTERVAL, limit=DEFAULT_LIMIT):
-    """Fetch market data with detailed debugging"""
+    """Fetch 1-minute market data with enhanced debugging"""
     step = "DATA_FETCH"
     try:
-        log_step(step, "Starting API call", {"symbol": symbol, "interval": interval, "limit": limit})
+        log_step(step, "Initiating API request", {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit
+        })
         
         endpoint = f"{MEXC_FUTURES_BASE_URL}/kline/{symbol}"
-        params = {"interval": interval, "limit": limit}
-        
-        response = requests.get(endpoint, params=params, timeout=15)
-        log_step(step, f"API response status: {response.status_code}")
-        
+        response = requests.get(endpoint, params={"interval": interval, "limit": limit}, timeout=15)
         response.raise_for_status()
+        
+        log_step(step, f"API response received - Status: {response.status_code}")
         data = response.json()
-        log_step(step, "Raw API response", data)
-
+        
         if not data.get("success", False):
-            log_step(step, "API success=False", data)
+            log_step(step, "API response indicates failure", data, 'error')
             return None
 
         raw_data = data.get("data", {})
         if not raw_data.get("time"):
-            log_step(step, "Empty time data", raw_data)
+            log_step(step, "Missing time data in response", raw_data, 'error')
             return None
 
-        # DataFrame construction debugging
-        log_step(step, "Building DataFrame")
+        # Construct DataFrame with type safety
         df = pd.DataFrame({
-            "timestamp": pd.to_datetime(raw_data["time"], unit="s", utc=True),
-            "open": pd.to_numeric(raw_data["realOpen"], errors="coerce"),
-            "high": pd.to_numeric(raw_data["realHigh"], errors="coerce"),
-            "low": pd.to_numeric(raw_data["realLow"], errors="coerce"),
-            "close": pd.to_numeric(raw_data["realClose"], errors="coerce"),
-            "volume": pd.to_numeric(raw_data["vol"], errors="coerce")
+            "timestamp": pd.to_datetime(raw_data["time"], unit='s', utc=True),
+            "open": pd.to_numeric(raw_data["realOpen"], errors='coerce'),
+            "high": pd.to_numeric(raw_data["realHigh"], errors='coerce'),
+            "low": pd.to_numeric(raw_data["realLow"], errors='coerce'),
+            "close": pd.to_numeric(raw_data["realClose"], errors='coerce'),
+            "volume": pd.to_numeric(raw_data["vol"], errors='coerce')
         })
         
-        log_step(step, "DataFrame shape after creation", df.shape)
-        
-        # Data cleaning
+        # Data validation pipeline
         initial_count = len(df)
-        df = df.dropna()
-        log_step(step, f"Data cleaning: {initial_count} -> {len(df)} rows remaining")
+        df = df.dropna().reset_index(drop=True)
+        log_step(step, f"Data cleaning complete - Remaining: {len(df)}/{initial_count} rows")
         
-        if len(df) < 50:
-            log_step(step, f"Insufficient data after cleaning: {len(df)}/50")
+        if len(df) < 100:
+            log_step(step, "Insufficient data after cleaning", {"min_required": 100, "actual": len(df)}, 'error')
             return None
             
-        log_step(step, "Final data sample", df.iloc[:3].to_dict())
-        return df.iloc[-250:]
+        log_step(step, "Data sample", df.iloc[:3].to_dict('records'))
+        return df.iloc[-250:]  # Last 4+ hours of data
 
     except Exception as e:
-        log_step(step, f"Critical error: {str(e)}")
-        app.logger.error(traceback.format_exc())
+        log_step(step, f"Critical error: {str(e)}", traceback.format_exc(), 'error')
         return None
 
 def calculate_indicators(df):
-    """Indicator calculation with step-by-step validation"""
-    step = "INDICATORS"
+    """Advanced technical analysis with validation gates"""
+    step = "INDICATOR_CALCULATION"
     try:
-        if df is None:
-            log_step(step, "No input data")
-            return None
-            
-        log_step(step, "Input data shape", df.shape)
+        log_step(step, "Starting indicator calculation", {"input_shape": df.shape})
         
-        # RSI Calculation
-        log_step(step, "Calculating RSI")
+        # Core Indicators
         df["rsi"] = ta.rsi(df["close"], length=14)
-        if df["rsi"].isnull().all():
-            log_step(step, "RSI calculation failed")
-            return None
-
-        # Bollinger Bands
-        log_step(step, "Calculating Bollinger Bands")
-        bbands = ta.bbands(df["close"], length=20, std=2)
-        if bbands is None:
-            log_step(step, "Bollinger Bands failed")
+        df["ema_20"] = ta.ema(df["close"], length=20)
+        df["ema_50"] = ta.ema(df["close"], length=50)
+        
+        # Bollinger Bands with adaptive volatility
+        bbands = ta.bbands(df["close"], length=14, std=1.5)
+        df = pd.concat([df, bbands.add_prefix("bb_")], axis=1)
+        df["bb_width"] = df["bb_BBU_14_1.5"] - df["bb_BBL_14_1.5"]
+        
+        # Volume analysis
+        df["volume_ma"] = df["volume"].rolling(20).mean()
+        df["volume_spike"] = (df["volume"] > 1.5 * df["volume_ma"]).astype(int)
+        
+        # Time-based features
+        df["hour"] = df["timestamp"].dt.hour
+        df["session"] = np.select(
+            [
+                df["hour"].between(9, 12),
+                df["hour"].between(13, 16)
+            ],
+            ["morning", "afternoon"],
+            default="other"
+        )
+        
+        # Validate calculations
+        required_columns = [
+            'close', 'rsi', 'ema_20', 'ema_50', 
+            'bb_BBU_14_1.5', 'bb_BBL_14_1.5',
+            'volume_ma', 'volume_spike', 'hour'
+        ]
+        missing = [col for col in required_columns if col not in df.columns]
+        if missing:
+            log_step(step, f"Missing critical columns: {missing}", 'error')
             return None
             
-        df = pd.concat([df, bbands], axis=1)
-        log_step(step, "Post-BBANDS columns", df.columns.tolist())
-
-        # EMA Calculation
-        log_step(step, "Calculating EMA")
-        df["ema_20"] = ta.ema(df["close"], length=20)
-        if df["ema_20"].isnull().all():
-            log_step(step, "EMA calculation failed")
-            return None
-
-        # Validate final columns
-        required_cols = ["close", "rsi", "BBU_20_2.0", "BBL_20_2.0", "ema_20"]
-        missing = [col for col in required_cols if col not in df.columns]
-        if missing:
-            log_step(step, f"Missing columns: {missing}")
-            return None
-
-        log_step(step, "Final indicators sample", df[required_cols].iloc[-3:].to_dict())
-        return df.iloc[-100:]
+        log_step(step, "Indicator calculation successful", {
+            "final_shape": df.shape,
+            "columns": df.columns.tolist()
+        })
+        return df.iloc[-100:]  # Use most recent 100 periods
 
     except Exception as e:
-        log_step(step, f"Calculation error: {str(e)}")
-        app.logger.error(traceback.format_exc())
+        log_step(step, f"Calculation failed: {str(e)}", traceback.format_exc(), 'error')
         return None
 
 def generate_signals(df):
-    """Signal generation with detailed checks"""
-    step = "SIGNALS"
+    """Multi-factor signal generation with ML integration"""
+    step = "SIGNAL_GENERATION"
     try:
-        if df is None or df.empty:
-            log_step(step, "No data for signals")
-            return []
-
+        log_step(step, "Starting signal generation")
         latest = df.iloc[-1]
-        log_step(step, "Latest data point", latest.to_dict())
-
         signals = []
         
-        # Bollinger Bands Check
-        bb_upper = latest["BBU_20_2.0"]
-        bb_lower = latest["BBL_20_2.0"]
-        price = latest["close"]
+        # Price Action Signals
+        price_change_5m = latest["close"] - df.iloc[-5]["close"]
+        signals.append(f"5m Change: {'+' if price_change_5m >=0 else ''}{price_change_5m:.2f}")
         
-        log_step(step, f"BB Check: Price {price} vs [{bb_lower}, {bb_upper}]")
-        if price > bb_upper:
-            signals.append("Upper Band Breakout")
-        elif price < bb_lower:
-            signals.append("Lower Band Breakdown")
-
-        # RSI Check
-        rsi = latest["rsi"]
-        ema = latest["ema_20"]
-        log_step(step, f"RSI Check: {rsi} (EMA20: {ema})")
-        if rsi < 35 and price > ema:
+        # Bollinger Band Signals
+        bb_upper = latest["bb_BBU_14_1.5"]
+        bb_lower = latest["bb_BBL_14_1.5"]
+        if latest["close"] > bb_upper:
+            signals.append("BB Breakout")
+        elif latest["close"] < bb_lower:
+            signals.append("BB Breakdown")
+        
+        # RSI + EMA Convergence
+        if latest["rsi"] < 35 and latest["close"] > latest["ema_20"]:
             signals.append("RSI Oversold Bounce")
-        elif rsi > 65 and price < ema:
+        elif latest["rsi"] > 65 and latest["close"] < latest["ema_20"]:
             signals.append("RSI Overbought Rejection")
+            
+        # Volume Spike Alert
+        if latest["volume_spike"] == 1:
+            signals.append("Volume Spike Detected")
+            
+        # Session-Based Pattern
+        if latest["session"] == "morning":
+            signals.append("Morning Session Trend")
+            
+        # ML Prediction
+        if model is not None:
+            try:
+                features = df[[
+                    'rsi', 'close', 'bb_BBU_14_1.5', 'bb_BBL_14_1.5',
+                    'volume_ma', 'hour'
+                ]].iloc[-1].values.reshape(1, -1)
+                prediction = model.predict(features)[0]
+                signals.append(f"ML: {'Bullish' if prediction == 1 else 'Bearish'}")
+            except Exception as ml_error:
+                log_step(step, f"ML prediction failed: {str(ml_error)}", 'error')
 
-        log_step(step, f"Generated signals: {signals}")
+        log_step(step, f"Generated {len(signals)} signals", signals)
         return signals
 
     except Exception as e:
-        log_step(step, f"Signal error: {str(e)}")
-        app.logger.error(traceback.format_exc())
+        log_step(step, f"Signal generation failed: {str(e)}", traceback.format_exc(), 'error')
         return []
 
-@app.route("/debug")
-def full_debug():
-    """Special endpoint for complete debugging"""
-    debug_info = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "environment": {
-            "symbol": DEFAULT_SYMBOL,
-            "interval": DEFAULT_INTERVAL,
-            "limit": DEFAULT_LIMIT
-        }
-    }
-    
-    try:
-        # Step 1: Raw API Data
-        raw_data = get_futures_kline()
-        debug_info["raw_data"] = {
-            "status": "success" if raw_data is not None else "failed",
-            "shape": raw_data.shape if raw_data is not None else None,
-            "sample": raw_data.iloc[:3].to_dict() if raw_data is not None else None
-        }
-
-        # Step 2: Indicators
-        if raw_data is not None:
-            indicators = calculate_indicators(raw_data)
-            debug_info["indicators"] = {
-                "status": "success" if indicators is not None else "failed",
-                "columns": indicators.columns.tolist() if indicators is not None else None,
-                "sample": indicators.iloc[:3].to_dict() if indicators is not None else None
-            }
-        else:
-            debug_info["indicators"] = {"status": "skipped"}
-
-        # Step 3: Signals
-        if indicators is not None:
-            signals = generate_signals(indicators)
-            debug_info["signals"] = {
-                "generated": signals,
-                "latest_data": indicators.iloc[-1].to_dict() if not indicators.empty else None
-            }
-        else:
-            debug_info["signals"] = {"status": "skipped"}
-
-        return jsonify(debug_info)
-
-    except Exception as e:
-        debug_info["error"] = {
-            "message": str(e),
-            "traceback": traceback.format_exc()
-        }
-        return jsonify(debug_info), 500
-
 @app.route("/")
-def main_handler():
+def trading_dashboard():
+    """Main trading endpoint with full observability"""
     try:
-        log_step("MAIN", "Process started")
+        log_step("SYSTEM", "Processing pipeline started")
         
-        # Data Fetching
-        df = get_futures_kline()
-        if df is None:
-            log_step("MAIN", "Data fetch failed")
+        # Data Acquisition
+        raw_data = get_futures_kline()
+        if raw_data is None:
             return jsonify({
                 "status": "error",
                 "stage": "data_fetch",
                 "message": "Failed to retrieve market data",
-                "advice": [
-                    "Check API availability",
-                    "Verify symbol/interval parameters",
-                    "Ensure network connectivity"
-                ]
+                "advice": ["Check API status", "Verify symbol/interval"]
             }), 503
 
-        # Indicator Calculation
-        processed_df = calculate_indicators(df)
-        if processed_df is None:
-            log_step("MAIN", "Indicator calculation failed")
+        # Technical Analysis
+        processed_data = calculate_indicators(raw_data)
+        if processed_data is None:
             return jsonify({
                 "status": "error",
                 "stage": "indicators",
-                "message": "Technical analysis failed",
                 "data_stats": {
-                    "initial_rows": len(df),
-                    "columns": df.columns.tolist(),
-                    "last_close": df["close"].iloc[-1] if not df.empty else None
+                    "initial_rows": len(raw_data),
+                    "columns": raw_data.columns.tolist(),
+                    "last_timestamp": raw_data["timestamp"].iloc[-1].isoformat()
                 }
             }), 500
 
         # Signal Generation
-        signals = generate_signals(processed_df)
-        latest = processed_df.iloc[-1]
+        signals = generate_signals(processed_data)
+        latest = processed_data.iloc[-1]
 
         return jsonify({
             "status": "success",
@@ -262,37 +233,25 @@ def main_handler():
             "metrics": {
                 "price": latest["close"],
                 "rsi": latest["rsi"],
-                "bb_upper": latest["BBU_20_2.0"],
-                "bb_lower": latest["BBL_20_2.0"],
-                "ema_20": latest["ema_20"]
+                "ema_20": latest["ema_20"],
+                "bb_upper": latest["bb_BBU_14_1.5"],
+                "bb_lower": latest["bb_BBL_14_1.5"],
+                "volume": latest["volume"]
             },
-            "debug": {
-                "data_points": len(processed_df),
-                "timestamp": latest.name.isoformat() if hasattr(latest.name, 'isoformat') else None
+            "context": {
+                "interval": DEFAULT_INTERVAL,
+                "symbol": DEFAULT_SYMBOL,
+                "model_active": model is not None
             }
         })
 
     except Exception as e:
-        log_step("MAIN", f"Unhandled exception: {str(e)}")
-        app.logger.error(traceback.format_exc())
+        log_step("SYSTEM", f"Unhandled exception: {str(e)}", traceback.format_exc(), 'error')
         return jsonify({
             "status": "error",
-            "stage": "unhandled",
-            "message": "Critical system failure",
-            "error_details": str(e),
-            "traceback": traceback.format_exc()
+            "message": "System failure",
+            "error_details": str(e)[:200]
         }), 500
 
-@app.route("/health")
-def health_check():
-    return jsonify({
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
-        "system": {
-            "python_version": os.sys.version,
-            "platform": os.sys.platform
-        }
-    })
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)), debug=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
