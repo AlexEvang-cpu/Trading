@@ -59,57 +59,87 @@ def get_futures_kline(symbol=DEFAULT_SYMBOL, interval=DEFAULT_INTERVAL, limit=DE
     return None
 
 def calculate_indicators(df):
-    """Calculate technical indicators"""
+    """Calculate technical indicators with enhanced features"""
     if df is None or df.empty or len(df) < 20:
         app.logger.error("Insufficient data for indicators")
         return None
 
     try:
-        # Calculate RSI
+        # Original indicators
         df["rsi"] = ta.rsi(df["close"], length=14)
-        
-        # Calculate Bollinger Bands
         bbands = ta.bbands(df["close"], length=20, std=2)
         df = pd.concat([df, bbands], axis=1)
-        
-        # Clean and validate
         df = df.rename(columns={
             "BBU_20_2.0": "upper_band",
             "BBL_20_2.0": "lower_band"
         }).dropna()
         
-        required_cols = ["close", "rsi", "upper_band", "lower_band"]
+        # New indicators
+        df["ema_50"] = ta.ema(df["close"], length=50)
+        adx = ta.adx(df["high"], df["low"], df["close"], length=14)
+        df = pd.concat([df, adx], axis=1)
+        
+        # Bollinger Band width analysis
+        df["band_width"] = df["upper_band"] - df["lower_band"]
+        df["band_width_ma"] = df["band_width"].rolling(20).mean()
+
+        required_cols = ["close", "rsi", "upper_band", "lower_band",
+                        "ema_50", "ADX_14", "band_width", "band_width_ma"]
         if not all(col in df.columns for col in required_cols):
             app.logger.error("Missing required columns after calculations")
             return None
 
-        return df.iloc[-100:]  # Return most recent data
+        return df.iloc[-100:]
 
     except Exception as e:
         app.logger.error(f"Indicator error: {str(e)}")
         return None
 
 def generate_signals(df):
-    """Generate trading signals"""
+    """Generate trading signals with enhanced conditions"""
     if df is None or df.empty:
         return []
     
     try:
-        latest = df.iloc[-1]
         signals = []
-        
-        # RSI Signals
+        latest = df.iloc[-1]
+        prev = df.iloc[-5]  # 5 periods back for momentum check
+
+        # Original signals
         if latest["rsi"] > 70:
             signals.append("RSI Overbought")
         elif latest["rsi"] < 30:
             signals.append("RSI Oversold")
             
-        # Bollinger Bands Signals
         if latest["close"] > latest["upper_band"]:
             signals.append("Price Above Upper Band")
         elif latest["close"] < latest["lower_band"]:
             signals.append("Price Below Lower Band")
-            
+
+        # New signals
+        # 1. Bollinger Band Squeeze
+        if latest["band_width"] < 0.5 * latest["band_width_ma"]:
+            signals.append("Volatility Squeeze Detected")
+
+        # 2. Momentum Check
+        if latest["rsi"] > 50 and latest["close"] > prev["close"]:
+            signals.append("Bullish Momentum")
+        elif latest["rsi"] < 50 and latest["close"] < prev["close"]:
+            signals.append("Bearish Momentum")
+
+        # 3. EMA Trend
+        if latest["close"] > latest["ema_50"]:
+            signals.append("Price Above EMA50")
+        else:
+            signals.append("Price Below EMA50")
+
+        # 4. ADX Trend Strength
+        if latest["ADX_14"] > 25:
+            if latest["close"] > prev["close"]:
+                signals.append("Strong Uptrend (ADX > 25)")
+            else:
+                signals.append("Strong Downtrend (ADX > 25)")
+
         return signals
     
     except Exception as e:
@@ -146,6 +176,8 @@ def main_endpoint():
                 "rsi": round(latest["rsi"], 2),
                 "upper_band": round(latest["upper_band"], 2),
                 "lower_band": round(latest["lower_band"], 2),
+                "ema_50": round(latest["ema_50"], 2),
+                "adx": round(latest["ADX_14"], 2),
                 "timestamp": latest["timestamp"].isoformat()
             },
             "meta": {
