@@ -7,6 +7,7 @@ import traceback
 from flask import Flask, jsonify
 from datetime import datetime
 from joblib import load
+from apscheduler.schedulers.background import BackgroundScheduler  # NEW
 
 # Configuration
 MEXC_FUTURES_BASE_URL = "https://contract.mexc.com/api/v1/contract"
@@ -14,13 +15,15 @@ DEFAULT_SYMBOL = os.getenv("TRADING_SYMBOL", "BTC_USDT")
 DEFAULT_INTERVAL = os.getenv("TRADING_INTERVAL", "Min1")
 DEFAULT_LIMIT = int(os.getenv("DATA_LIMIT", "300"))
 MODEL_PATH = os.getenv("MODEL_PATH", "price_model.joblib")
+TELEGRAM_BOT_TOKEN = os.getenv("7767920761:AAHLm9Lgs4UQpaUon04aPc1AVfKAgTtHep8")  # NEW
+TELEGRAM_CHAT_ID = os.getenv("5704086227")      # NEW
 
 # Enhanced Trading parameters
 TRADE_PARAMS = {
     "risk_reward_ratio": 2.0,
-    "max_position_size": 0.08,  # Increased from 0.05
-    "stop_loss_pct": 1.2,       # More flexible stop-loss
-    "take_profit_pct": 2.5      # Wider take-profit
+    "max_position_size": 0.08,
+    "stop_loss_pct": 1.2,
+    "take_profit_pct": 2.5
 }
 
 # Signal weights for confidence calculation
@@ -46,6 +49,28 @@ except ImportError:
     app.logger.warning("ML features disabled - scikit-learn not installed")
 
 model = load(MODEL_PATH) if ML_ENABLED and os.path.exists(MODEL_PATH) else None
+
+# Initialize scheduler
+scheduler = BackgroundScheduler()  # NEW
+
+def send_telegram_alert(message):  # NEW FUNCTION
+    """Send trading alerts to Telegram with error handling"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        app.logger.warning("Telegram credentials missing - notifications disabled")
+        return False
+
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown"
+        }
+        response = requests.post(url, json=payload, timeout=10)
+        return response.status_code == 200
+    except Exception as e:
+        app.logger.error(f"Telegram send failed: {str(e)}")
+        return False
 
 def log_step(step, message, data=None, level='debug'):
     """Structured logging with data sanitization"""
@@ -82,7 +107,6 @@ def get_futures_kline(symbol=DEFAULT_SYMBOL, interval=DEFAULT_INTERVAL, limit=DE
             log_step(step, "Missing time data in response", raw_data, 'error')
             return None
 
-        # Construct DataFrame with type safety
         df = pd.DataFrame({
             "timestamp": pd.to_datetime(raw_data["time"], unit='s', utc=True),
             "open": pd.to_numeric(raw_data["realOpen"], errors='coerce'),
@@ -92,7 +116,6 @@ def get_futures_kline(symbol=DEFAULT_SYMBOL, interval=DEFAULT_INTERVAL, limit=DE
             "volume": pd.to_numeric(raw_data["vol"], errors='coerce')
         })
         
-        # Data validation pipeline
         initial_count = len(df)
         df = df.dropna().reset_index(drop=True)
         log_step(step, f"Data cleaning complete - Remaining: {len(df)}/{initial_count} rows")
@@ -114,36 +137,30 @@ def calculate_indicators(df):
     try:
         log_step(step, "Starting indicator calculation", {"input_shape": df.shape})
         
-        # Core Indicators
         df["rsi"] = ta.rsi(df["close"], length=14)
-        df["rsi_ma"] = df["rsi"].rolling(14).mean()  # RSI trend filter
+        df["rsi_ma"] = df["rsi"].rolling(14).mean()
         df["ema_20"] = ta.ema(df["close"], length=20)
         df["ema_50"] = ta.ema(df["close"], length=50)
         
-        # Enhanced Bollinger Bands
-        bbands = ta.bbands(df["close"], length=20, std=2)  # From 14,1.5
+        bbands = ta.bbands(df["close"], length=20, std=2)
         df = pd.concat([df, bbands.add_prefix("bb_")], axis=1)
         df["bb_width"] = df["bb_BBU_20_2.0"] - df["bb_BBL_20_2.0"]
         
-        # Volatility measurement
         df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=14)
         
-        # Volume analysis
         df["volume_ma"] = df["volume"].rolling(20).mean()
-        df["volume_spike"] = (df["volume"] > 2.0 * df["volume_ma"]).astype(int)  # From 1.5x
+        df["volume_spike"] = (df["volume"] > 2.0 * df["volume_ma"]).astype(int)
         
-        # Time-based features
         df["hour"] = df["timestamp"].dt.hour
         df["session"] = np.select(
             [
-                df["hour"].between(8, 11),    # Expanded morning session
-                df["hour"].between(12, 15)     # Adjusted afternoon session
+                df["hour"].between(8, 11),
+                df["hour"].between(12, 15)
             ],
             ["morning", "afternoon"],
             default="other"
         )
         
-        # Validate calculations
         required_columns = [
             'close', 'rsi', 'rsi_ma', 'ema_20', 'ema_50', 
             'bb_BBU_20_2.0', 'bb_BBL_20_2.0', 'atr',
@@ -172,23 +189,18 @@ def generate_signals(df):
         latest = df.iloc[-1]
         signals = []
         
-        # Price Momentum
         price_change_5m = latest["close"] - df.iloc[-5]["close"]
         change_pct = price_change_5m / df.iloc[-5]["close"]
         signals.append(f"5m Change: {price_change_5m:+.2f} ({change_pct:.2%})")
         
-        # Dynamic Bollinger Band Signals
         bb_upper = latest["bb_BBU_20_2.0"]
         bb_lower = latest["bb_BBL_20_2.0"]
-        bb_avg = (bb_upper + bb_lower) / 2
         
-        # Price position relative to BB
-        if latest["close"] > bb_upper * 0.995:  # 0.5% below upper band
+        if latest["close"] > bb_upper * 0.995:
             signals.append(f"BB Approach Upper ({latest['close']:.2f} > {bb_upper*0.995:.2f})")
-        elif latest["close"] < bb_lower * 1.005:  # 0.5% above lower band
+        elif latest["close"] < bb_lower * 1.005:
             signals.append(f"BB Approach Lower ({latest['close']:.2f} < {bb_lower*1.005:.2f})")
         
-        # Dynamic RSI thresholds
         trend_direction = 1 if latest["close"] > latest["ema_20"] else -1
         rsi_buy_threshold = 40 + (5 * trend_direction)
         rsi_sell_threshold = 60 + (5 * trend_direction)
@@ -198,18 +210,15 @@ def generate_signals(df):
         elif latest["rsi"] > rsi_sell_threshold and latest["rsi"] < latest["rsi_ma"]:
             signals.append(f"RSI Bearish ({latest['rsi']:.1f} > {rsi_sell_threshold})")
             
-        # Volume Spike Detection
         volume_ratio = latest["volume"] / latest["volume_ma"]
         if latest["volume_spike"] == 1:
             signals.append(f"Strong Volume Spike ({volume_ratio:.1f}x MA)")
             
-        # Session Pattern Recognition
         if latest["session"] == "morning" and latest["hour"] < 12:
             signals.append("Morning Trend Potential")
         elif latest["session"] == "afternoon" and latest["hour"] < 16:
             signals.append("Afternoon Trend Potential")
             
-        # ML Prediction Integration
         if model is not None:
             try:
                 features = df[[
@@ -252,7 +261,6 @@ def generate_trading_decision(signals, metrics):
     current_price = metrics["price"]
     atr = metrics["atr"]
     
-    # Weighted signal processing
     for signal in signals:
         decision["detailed_signals"].append(signal)
         weight = 1.0
@@ -268,10 +276,9 @@ def generate_trading_decision(signals, metrics):
         else:
             decision["signal_strength"]["neutral"] += weight
 
-    # Confidence calculation with RSI factor
     total_strength = sum(decision["signal_strength"].values())
     if total_strength > 0:
-        rsi_factor = 1 - abs(metrics["rsi"] - 50)/50  # Max at 50 RSI
+        rsi_factor = 1 - abs(metrics["rsi"] - 50)/50
         raw_confidence = max(
             decision["signal_strength"]["bullish"],
             decision["signal_strength"]["bearish"]
@@ -279,9 +286,8 @@ def generate_trading_decision(signals, metrics):
         
         decision["confidence"] = round((raw_confidence * 0.7 + rsi_factor * 0.3) * 100, 1)
         
-        # Determine action with threshold
         if decision["signal_strength"]["bullish"] > decision["signal_strength"]["bearish"]:
-            if decision["confidence"] >= 55:  # Confidence threshold
+            if decision["confidence"] >= 55:
                 decision["action"] = "long"
                 decision["risk_parameters"]["stop_loss"] = round(current_price - atr * 1.2, 2)
                 decision["risk_parameters"]["take_profit"] = round(current_price + atr * TRADE_PARAMS["risk_reward_ratio"], 2)
@@ -291,7 +297,6 @@ def generate_trading_decision(signals, metrics):
                 decision["risk_parameters"]["stop_loss"] = round(current_price + atr * 1.2, 2)
                 decision["risk_parameters"]["take_profit"] = round(current_price - atr * TRADE_PARAMS["risk_reward_ratio"], 2)
 
-    # Dynamic position sizing
     if decision["action"] != "hold":
         volatility_ratio = atr / current_price
         confidence_factor = decision["confidence"] / 100
@@ -308,7 +313,6 @@ def trading_dashboard():
     try:
         log_step("SYSTEM", "Processing pipeline started")
         
-        # Data Acquisition
         raw_data = get_futures_kline()
         if raw_data is None:
             return jsonify({
@@ -318,7 +322,6 @@ def trading_dashboard():
                 "advice": ["Check API status", "Verify symbol/interval"]
             }), 503
 
-        # Technical Analysis
         processed_data = calculate_indicators(raw_data)
         if processed_data is None:
             return jsonify({
@@ -331,7 +334,6 @@ def trading_dashboard():
                 }
             }), 500
 
-        # Generate outputs
         signals = generate_signals(processed_data)
         latest = processed_data.iloc[-1]
         metrics = {
@@ -350,7 +352,7 @@ def trading_dashboard():
             "hour": int(latest["hour"])
         }
 
-        return jsonify({
+        response_data = {
             "status": "success",
             "decision": generate_trading_decision(signals, metrics),
             "metrics": metrics,
@@ -359,7 +361,23 @@ def trading_dashboard():
                 "symbol": DEFAULT_SYMBOL,
                 "model_active": model is not None
             }
-        })
+        }
+
+        # Telegram notification logic  # NEW
+        if response_data["decision"]["action"] != "hold":
+            message = (
+                f"🚨 *{DEFAULT_SYMBOL} Trade Signal* 🚨\n"
+                f"Action: {response_data['decision']['action'].upper()}\n"
+                f"Confidence: {response_data['decision']['confidence']}%\n"
+                f"Price: {metrics['price']}\n"
+                f"SL: {response_data['decision']['risk_parameters']['stop_loss']}\n"
+                f"TP: {response_data['decision']['risk_parameters']['take_profit']}\n"
+                f"RSI: {metrics['rsi']:.1f}\n"
+                f"Volume: {metrics['volume']}"
+            )
+            send_telegram_alert(message)
+
+        return jsonify(response_data)
 
     except Exception as e:
         log_step("SYSTEM", f"Unhandled exception: {str(e)}", traceback.format_exc(), 'error')
@@ -368,6 +386,28 @@ def trading_dashboard():
             "message": "System failure",
             "error_details": str(e)[:200]
         }), 500
+
+def scheduled_update():  # NEW FUNCTION
+    """Send regular status updates to Telegram"""
+    with app.app_context():
+        app.logger.info("Running scheduled update")
+        try:
+            client = app.test_client()
+            response = client.get('/')
+            
+            if response.status_code == 200:
+                data = response.json
+                message = (
+                    f"⏰ *{DEFAULT_SYMBOL} Status Update*\n"
+                    f"Price: {data['metrics']['price']}\n"
+                    f"RSI: {data['metrics']['rsi']:.1f}\n"
+                    f"Volume: {data['metrics']['volume']}\n"
+                    f"Current Action: {data['decision']['action'].upper()}"
+                )
+                send_telegram_alert(message)
+                
+        except Exception as e:
+            app.logger.error(f"Scheduled update failed: {str(e)}")
 
 @app.route("/health")
 def health_check():
@@ -381,4 +421,8 @@ def health_check():
     })
 
 if __name__ == "__main__":
+    # Initialize scheduler  # NEW
+    scheduler.add_job(scheduled_update, 'interval', minutes=5)
+    scheduler.start()
+    
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
