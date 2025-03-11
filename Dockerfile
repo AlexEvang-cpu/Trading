@@ -7,7 +7,7 @@ RUN apt-get update && \
     python3-dev \
     libopenblas-dev \
     libpng-dev \
-    libfreetype6-dev && \    # Needed for matplotlib
+    libfreetype6-dev && \  # Keep comment on separate line
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
