@@ -9,3 +9,5 @@ joblib==1.3.2
 gunicorn==21.2.0
 matplotlib==3.7.1
 seaborn==0.12.2
+apscheduler==3.10.1          # NEW for Telegram notifications
+python-dotenv==1.0.0         # NEW for environment variables
