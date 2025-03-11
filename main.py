@@ -18,9 +18,9 @@ DEFAULT_LIMIT = int(os.getenv("DATA_LIMIT", "300"))
 MODEL_PATH = os.getenv("MODEL_PATH", "price_model.joblib")
 
 # Telegram Configuration (CHANGE THESE IN YOUR .env FILE!)
-TELEGRAM_BOT_TOKEN = os.getenv("7767920761:AAHLm9Lgs4UQpaUon04aPc1AVfKAgTtHep8")  # Get from @BotFather
-TELEGRAM_CHAT_ID = os.getenv("5704086227")      # Use /getUpdates to find
-TELEGRAM_WEBHOOK_SECRET = os.getenv("5f4dcc3b5aa765d61d8327dhb882cf99231f2a717d4c5d7c2f5x3c4f4f5b6a7x")# Generate random string
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # Get from @BotFather
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")      # Use /getUpdates to find
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_SECRET")# Generate random string
 
 # ===================== TRADING PARAMETERS ===================== #
 TRADE_PARAMS = {
