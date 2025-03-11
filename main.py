@@ -15,12 +15,23 @@ DEFAULT_INTERVAL = os.getenv("TRADING_INTERVAL", "Min1")
 DEFAULT_LIMIT = int(os.getenv("DATA_LIMIT", "300"))
 MODEL_PATH = os.getenv("MODEL_PATH", "price_model.joblib")
 
-# Trading parameters
+# Enhanced Trading parameters
 TRADE_PARAMS = {
     "risk_reward_ratio": 2.0,
-    "max_position_size": 0.05,
-    "stop_loss_pct": 1.0,
-    "take_profit_pct": 2.0
+    "max_position_size": 0.08,  # Increased from 0.05
+    "stop_loss_pct": 1.2,       # More flexible stop-loss
+    "take_profit_pct": 2.5      # Wider take-profit
+}
+
+# Signal weights for confidence calculation
+SIGNAL_WEIGHTS = {
+    "BB Breakout": 1.7,
+    "BB Breakdown": 1.7,
+    "RSI Oversold": 1.4,
+    "RSI Overbought": 1.4,
+    "Volume Spike": 1.3,
+    "Session Trend": 1.2,
+    "ML Prediction": 2.0
 }
 
 app = Flask(__name__)
@@ -98,31 +109,35 @@ def get_futures_kline(symbol=DEFAULT_SYMBOL, interval=DEFAULT_INTERVAL, limit=DE
         return None
 
 def calculate_indicators(df):
-    """Advanced technical analysis with validation gates"""
+    """Enhanced technical analysis with dynamic parameters"""
     step = "INDICATOR_CALCULATION"
     try:
         log_step(step, "Starting indicator calculation", {"input_shape": df.shape})
         
         # Core Indicators
         df["rsi"] = ta.rsi(df["close"], length=14)
+        df["rsi_ma"] = df["rsi"].rolling(14).mean()  # RSI trend filter
         df["ema_20"] = ta.ema(df["close"], length=20)
         df["ema_50"] = ta.ema(df["close"], length=50)
         
-        # Bollinger Bands with adaptive volatility
-        bbands = ta.bbands(df["close"], length=14, std=1.5)
+        # Enhanced Bollinger Bands
+        bbands = ta.bbands(df["close"], length=20, std=2)  # From 14,1.5
         df = pd.concat([df, bbands.add_prefix("bb_")], axis=1)
-        df["bb_width"] = df["bb_BBU_14_1.5"] - df["bb_BBL_14_1.5"]
+        df["bb_width"] = df["bb_BBU_20_2.0"] - df["bb_BBL_20_2.0"]
+        
+        # Volatility measurement
+        df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=14)
         
         # Volume analysis
         df["volume_ma"] = df["volume"].rolling(20).mean()
-        df["volume_spike"] = (df["volume"] > 1.5 * df["volume_ma"]).astype(int)
+        df["volume_spike"] = (df["volume"] > 2.0 * df["volume_ma"]).astype(int)  # From 1.5x
         
         # Time-based features
         df["hour"] = df["timestamp"].dt.hour
         df["session"] = np.select(
             [
-                df["hour"].between(9, 12),
-                df["hour"].between(13, 16)
+                df["hour"].between(8, 11),    # Expanded morning session
+                df["hour"].between(12, 15)     # Adjusted afternoon session
             ],
             ["morning", "afternoon"],
             default="other"
@@ -130,8 +145,8 @@ def calculate_indicators(df):
         
         # Validate calculations
         required_columns = [
-            'close', 'rsi', 'ema_20', 'ema_50', 
-            'bb_BBU_14_1.5', 'bb_BBL_14_1.5',
+            'close', 'rsi', 'rsi_ma', 'ema_20', 'ema_50', 
+            'bb_BBU_20_2.0', 'bb_BBL_20_2.0', 'atr',
             'volume_ma', 'volume_spike', 'hour'
         ]
         missing = [col for col in required_columns if col not in df.columns]
@@ -150,52 +165,61 @@ def calculate_indicators(df):
         return None
 
 def generate_signals(df):
-    """Multi-factor signal generation with ML integration"""
+    """Enhanced signal generation with dynamic thresholds"""
     step = "SIGNAL_GENERATION"
     try:
         log_step(step, "Starting signal generation")
         latest = df.iloc[-1]
         signals = []
         
-        # Price Action Signals
+        # Price Momentum
         price_change_5m = latest["close"] - df.iloc[-5]["close"]
-        signals.append(f"5m Change: {price_change_5m:+.2f} ({price_change_5m/df.iloc[-5]['close']:.2%})")
+        change_pct = price_change_5m / df.iloc[-5]["close"]
+        signals.append(f"5m Change: {price_change_5m:+.2f} ({change_pct:.2%})")
         
-        # Bollinger Band Signals
-        bb_upper = latest["bb_BBU_14_1.5"]
-        bb_lower = latest["bb_BBL_14_1.5"]
-        if latest["close"] > bb_upper:
-            signals.append(f"BB Breakout (Price: {latest['close']:.2f} > Upper: {bb_upper:.2f})")
-        elif latest["close"] < bb_lower:
-            signals.append(f"BB Breakdown (Price: {latest['close']:.2f} < Lower: {bb_lower:.2f})")
+        # Dynamic Bollinger Band Signals
+        bb_upper = latest["bb_BBU_20_2.0"]
+        bb_lower = latest["bb_BBL_20_2.0"]
+        bb_avg = (bb_upper + bb_lower) / 2
         
-        # RSI + EMA Convergence
-        rsi_threshold = 35 if latest["close"] > latest["ema_20"] else 65
-        if latest["rsi"] < 35 and latest["close"] > latest["ema_20"]:
-            signals.append(f"RSI Oversold Bounce (RSI: {latest['rsi']:.1f}, EMA20: {latest['ema_20']:.2f})")
-        elif latest["rsi"] > 65 and latest["close"] < latest["ema_20"]:
-            signals.append(f"RSI Overbought Rejection (RSI: {latest['rsi']:.1f}, EMA20: {latest['ema_20']:.2f})")
+        # Price position relative to BB
+        if latest["close"] > bb_upper * 0.995:  # 0.5% below upper band
+            signals.append(f"BB Approach Upper ({latest['close']:.2f} > {bb_upper*0.995:.2f})")
+        elif latest["close"] < bb_lower * 1.005:  # 0.5% above lower band
+            signals.append(f"BB Approach Lower ({latest['close']:.2f} < {bb_lower*1.005:.2f})")
+        
+        # Dynamic RSI thresholds
+        trend_direction = 1 if latest["close"] > latest["ema_20"] else -1
+        rsi_buy_threshold = 40 + (5 * trend_direction)
+        rsi_sell_threshold = 60 + (5 * trend_direction)
+        
+        if latest["rsi"] < rsi_buy_threshold and latest["rsi"] > latest["rsi_ma"]:
+            signals.append(f"RSI Bullish ({latest['rsi']:.1f} < {rsi_buy_threshold})")
+        elif latest["rsi"] > rsi_sell_threshold and latest["rsi"] < latest["rsi_ma"]:
+            signals.append(f"RSI Bearish ({latest['rsi']:.1f} > {rsi_sell_threshold})")
             
-        # Volume Spike Alert
+        # Volume Spike Detection
         volume_ratio = latest["volume"] / latest["volume_ma"]
         if latest["volume_spike"] == 1:
-            signals.append(f"Volume Spike ({volume_ratio:.1f}x MA)")
+            signals.append(f"Strong Volume Spike ({volume_ratio:.1f}x MA)")
             
-        # Session-Based Pattern
-        if latest["session"] == "morning":
-            signals.append("Morning Session Trend Detected")
+        # Session Pattern Recognition
+        if latest["session"] == "morning" and latest["hour"] < 12:
+            signals.append("Morning Trend Potential")
+        elif latest["session"] == "afternoon" and latest["hour"] < 16:
+            signals.append("Afternoon Trend Potential")
             
-        # ML Prediction
+        # ML Prediction Integration
         if model is not None:
             try:
                 features = df[[
-                    'rsi', 'close', 'bb_BBU_14_1.5', 'bb_BBL_14_1.5',
-                    'volume_ma', 'hour'
+                    'rsi', 'close', 'bb_BBU_20_2.0', 'bb_BBL_20_2.0',
+                    'volume_ma', 'hour', 'atr'
                 ]].iloc[-1].values.reshape(1, -1)
                 prediction = model.predict(features)[0]
                 proba = model.predict_proba(features)[0]
                 confidence = max(proba)
-                signals.append(f"ML: {'Bullish' if prediction == 1 else 'Bearish'} ({confidence:.1%} confidence)")
+                signals.append(f"ML: {'Bullish' if prediction == 1 else 'Bearish'} ({confidence:.1%})")
             except Exception as ml_error:
                 log_step(step, f"ML prediction failed: {str(ml_error)}", 'error')
 
@@ -207,14 +231,14 @@ def generate_signals(df):
         return []
 
 def generate_trading_decision(signals, metrics):
-    """Convert signals into executable trading decisions"""
+    """Enhanced decision making with weighted confidence"""
     decision = {
         "action": "hold",
         "confidence": 0.0,
         "signal_strength": {
-            "bullish": 0,
-            "bearish": 0,
-            "neutral": 0
+            "bullish": 0.0,
+            "bearish": 0.0,
+            "neutral": 0.0
         },
         "detailed_signals": [],
         "risk_parameters": {
@@ -225,44 +249,54 @@ def generate_trading_decision(signals, metrics):
         }
     }
     
-    # Calculate volatility-adjusted parameters
     current_price = metrics["price"]
-    atr = metrics["bb_width"] / 2
+    atr = metrics["atr"]
     
+    # Weighted signal processing
     for signal in signals:
         decision["detailed_signals"].append(signal)
-        
-        # Signal strength scoring
-        if any(keyword in signal for keyword in ["Breakout", "Bounce", "Bullish"]):
-            decision["signal_strength"]["bullish"] += 1
-        elif any(keyword in signal for keyword in ["Breakdown", "Rejection", "Bearish"]):
-            decision["signal_strength"]["bearish"] += 1
+        weight = 1.0
+        for key in SIGNAL_WEIGHTS:
+            if key in signal:
+                weight = SIGNAL_WEIGHTS[key]
+                break
+                
+        if any(kw in signal for kw in ["Bullish", "Upper", "Buy"]):
+            decision["signal_strength"]["bullish"] += weight
+        elif any(kw in signal for kw in ["Bearish", "Lower", "Sell"]):
+            decision["signal_strength"]["bearish"] += weight
         else:
-            decision["signal_strength"]["neutral"] += 1
+            decision["signal_strength"]["neutral"] += weight
 
-    # Calculate total strength
-    total = sum(decision["signal_strength"].values())
-    if total > 0:
-        decision["confidence"] = round(
-            (max(decision["signal_strength"]["bullish"], decision["signal_strength"]["bearish"]) / total) * 100, 
-            1
-        )
+    # Confidence calculation with RSI factor
+    total_strength = sum(decision["signal_strength"].values())
+    if total_strength > 0:
+        rsi_factor = 1 - abs(metrics["rsi"] - 50)/50  # Max at 50 RSI
+        raw_confidence = max(
+            decision["signal_strength"]["bullish"],
+            decision["signal_strength"]["bearish"]
+        ) / total_strength
         
-        # Determine action
+        decision["confidence"] = round((raw_confidence * 0.7 + rsi_factor * 0.3) * 100, 1)
+        
+        # Determine action with threshold
         if decision["signal_strength"]["bullish"] > decision["signal_strength"]["bearish"]:
-            decision["action"] = "long"
-            decision["risk_parameters"]["stop_loss"] = round(current_price - atr, 2)
-            decision["risk_parameters"]["take_profit"] = round(current_price + (atr * TRADE_PARAMS["risk_reward_ratio"]), 2)
+            if decision["confidence"] >= 55:  # Confidence threshold
+                decision["action"] = "long"
+                decision["risk_parameters"]["stop_loss"] = round(current_price - atr * 1.2, 2)
+                decision["risk_parameters"]["take_profit"] = round(current_price + atr * TRADE_PARAMS["risk_reward_ratio"], 2)
         elif decision["signal_strength"]["bearish"] > decision["signal_strength"]["bullish"]:
-            decision["action"] = "short"
-            decision["risk_parameters"]["stop_loss"] = round(current_price + atr, 2)
-            decision["risk_parameters"]["take_profit"] = round(current_price - (atr * TRADE_PARAMS["risk_reward_ratio"]), 2)
+            if decision["confidence"] >= 55:
+                decision["action"] = "short"
+                decision["risk_parameters"]["stop_loss"] = round(current_price + atr * 1.2, 2)
+                decision["risk_parameters"]["take_profit"] = round(current_price - atr * TRADE_PARAMS["risk_reward_ratio"], 2)
 
-    # Adjust position size based on volatility
+    # Dynamic position sizing
     if decision["action"] != "hold":
-        volatility_factor = atr / current_price
+        volatility_ratio = atr / current_price
+        confidence_factor = decision["confidence"] / 100
         decision["risk_parameters"]["position_size"] = round(
-            TRADE_PARAMS["max_position_size"] * (1 - min(volatility_factor, 0.5)), 
+            TRADE_PARAMS["max_position_size"] * confidence_factor * (1 - min(volatility_ratio, 0.3)),
             4
         )
 
@@ -303,11 +337,12 @@ def trading_dashboard():
         metrics = {
             "price": latest["close"],
             "rsi": latest["rsi"],
+            "rsi_ma": latest["rsi_ma"],
             "ema_20": latest["ema_20"],
             "ema_50": latest["ema_50"],
-            "bb_upper": latest["bb_BBU_14_1.5"],
-            "bb_lower": latest["bb_BBL_14_1.5"],
-            "bb_width": latest["bb_width"],
+            "bb_upper": latest["bb_BBU_20_2.0"],
+            "bb_lower": latest["bb_BBL_20_2.0"],
+            "atr": latest["atr"],
             "volume": latest["volume"],
             "volume_ma": latest["volume_ma"],
             "volume_spike": bool(latest["volume_spike"]),
