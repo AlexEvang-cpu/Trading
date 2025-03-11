@@ -45,7 +45,109 @@ def log_step(step, message, data=None, level='debug'):
         log_msg += f" | Data: {sanitized}"
     logger(log_msg)
 
-# ... [Keep the existing get_futures_kline and calculate_indicators functions] ...
+def get_futures_kline(symbol=DEFAULT_SYMBOL, interval=DEFAULT_INTERVAL, limit=DEFAULT_LIMIT):
+    """Fetch 1-minute market data with enhanced debugging"""
+    step = "DATA_FETCH"
+    try:
+        log_step(step, "Initiating API request", {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit
+        })
+        
+        endpoint = f"{MEXC_FUTURES_BASE_URL}/kline/{symbol}"
+        response = requests.get(endpoint, params={"interval": interval, "limit": limit}, timeout=15)
+        response.raise_for_status()
+        
+        log_step(step, f"API response received - Status: {response.status_code}")
+        data = response.json()
+        
+        if not data.get("success", False):
+            log_step(step, "API response indicates failure", data, 'error')
+            return None
+
+        raw_data = data.get("data", {})
+        if not raw_data.get("time"):
+            log_step(step, "Missing time data in response", raw_data, 'error')
+            return None
+
+        # Construct DataFrame with type safety
+        df = pd.DataFrame({
+            "timestamp": pd.to_datetime(raw_data["time"], unit='s', utc=True),
+            "open": pd.to_numeric(raw_data["realOpen"], errors='coerce'),
+            "high": pd.to_numeric(raw_data["realHigh"], errors='coerce'),
+            "low": pd.to_numeric(raw_data["realLow"], errors='coerce'),
+            "close": pd.to_numeric(raw_data["realClose"], errors='coerce'),
+            "volume": pd.to_numeric(raw_data["vol"], errors='coerce')
+        })
+        
+        # Data validation pipeline
+        initial_count = len(df)
+        df = df.dropna().reset_index(drop=True)
+        log_step(step, f"Data cleaning complete - Remaining: {len(df)}/{initial_count} rows")
+        
+        if len(df) < 100:
+            log_step(step, "Insufficient data after cleaning", {"min_required": 100, "actual": len(df)}, 'error')
+            return None
+            
+        log_step(step, "Data sample", df.iloc[:3].to_dict('records'))
+        return df.iloc[-250:]
+
+    except Exception as e:
+        log_step(step, f"Critical error: {str(e)}", traceback.format_exc(), 'error')
+        return None
+
+def calculate_indicators(df):
+    """Advanced technical analysis with validation gates"""
+    step = "INDICATOR_CALCULATION"
+    try:
+        log_step(step, "Starting indicator calculation", {"input_shape": df.shape})
+        
+        # Core Indicators
+        df["rsi"] = ta.rsi(df["close"], length=14)
+        df["ema_20"] = ta.ema(df["close"], length=20)
+        df["ema_50"] = ta.ema(df["close"], length=50)
+        
+        # Bollinger Bands with adaptive volatility
+        bbands = ta.bbands(df["close"], length=14, std=1.5)
+        df = pd.concat([df, bbands.add_prefix("bb_")], axis=1)
+        df["bb_width"] = df["bb_BBU_14_1.5"] - df["bb_BBL_14_1.5"]
+        
+        # Volume analysis
+        df["volume_ma"] = df["volume"].rolling(20).mean()
+        df["volume_spike"] = (df["volume"] > 1.5 * df["volume_ma"]).astype(int)
+        
+        # Time-based features
+        df["hour"] = df["timestamp"].dt.hour
+        df["session"] = np.select(
+            [
+                df["hour"].between(9, 12),
+                df["hour"].between(13, 16)
+            ],
+            ["morning", "afternoon"],
+            default="other"
+        )
+        
+        # Validate calculations
+        required_columns = [
+            'close', 'rsi', 'ema_20', 'ema_50', 
+            'bb_BBU_14_1.5', 'bb_BBL_14_1.5',
+            'volume_ma', 'volume_spike', 'hour'
+        ]
+        missing = [col for col in required_columns if col not in df.columns]
+        if missing:
+            log_step(step, f"Missing critical columns: {missing}", 'error')
+            return None
+            
+        log_step(step, "Indicator calculation successful", {
+            "final_shape": df.shape,
+            "columns": df.columns.tolist()
+        })
+        return df.iloc[-100:]
+
+    except Exception as e:
+        log_step(step, f"Calculation failed: {str(e)}", traceback.format_exc(), 'error')
+        return None
 
 def generate_signals(df):
     """Multi-factor signal generation with ML integration"""
@@ -125,7 +227,7 @@ def generate_trading_decision(signals, metrics):
     
     # Calculate volatility-adjusted parameters
     current_price = metrics["price"]
-    atr = metrics["bb_width"] / 2  # Use half Bollinger Band width as volatility measure
+    atr = metrics["bb_width"] / 2
     
     for signal in signals:
         decision["detailed_signals"].append(signal)
@@ -231,6 +333,17 @@ def trading_dashboard():
             "message": "System failure",
             "error_details": str(e)[:200]
         }), 500
+
+@app.route("/health")
+def health_check():
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "system": {
+            "python_version": os.sys.version,
+            "platform": os.sys.platform
+        }
+    })
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
