@@ -4,24 +4,21 @@ import pandas as pd
 import pandas_ta as ta
 import numpy as np
 import traceback
-import json
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 from datetime import datetime
 from joblib import load
-from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.background import BackgroundScheduler  # NEW
 
-# ====================== CONFIGURATION ====================== #
+# Configuration
 MEXC_FUTURES_BASE_URL = "https://contract.mexc.com/api/v1/contract"
 DEFAULT_SYMBOL = os.getenv("TRADING_SYMBOL", "BTC_USDT")
 DEFAULT_INTERVAL = os.getenv("TRADING_INTERVAL", "Min1")
 DEFAULT_LIMIT = int(os.getenv("DATA_LIMIT", "300"))
 MODEL_PATH = os.getenv("MODEL_PATH", "price_model.joblib")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # NEW
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")      # NEW
 
-# Telegram Configuration
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-# ===================== TRADING PARAMETERS ===================== #
+# Enhanced Trading parameters
 TRADE_PARAMS = {
     "risk_reward_ratio": 2.0,
     "max_position_size": 0.08,
@@ -29,6 +26,7 @@ TRADE_PARAMS = {
     "take_profit_pct": 2.5
 }
 
+# Signal weights for confidence calculation
 SIGNAL_WEIGHTS = {
     "BB Breakout": 1.7,
     "BB Breakdown": 1.7,
@@ -42,7 +40,7 @@ SIGNAL_WEIGHTS = {
 app = Flask(__name__)
 app.logger.setLevel('DEBUG')
 
-# ====================== ML INITIALIZATION ====================== #
+# ML Initialization
 try:
     from sklearn.ensemble import RandomForestClassifier
     ML_ENABLED = True
@@ -52,22 +50,63 @@ except ImportError:
 
 model = load(MODEL_PATH) if ML_ENABLED and os.path.exists(MODEL_PATH) else None
 
-# ====================== SCHEDULER SETUP ====================== #
-scheduler = BackgroundScheduler()
+# Initialize scheduler
+scheduler = BackgroundScheduler()  # NEW
 
-# ====================== CORE TRADING FUNCTIONS ====================== #
-def get_futures_kline(symbol=DEFAULT_SYMBOL, interval=DEFAULT_INTERVAL, limit=DEFAULT_LIMIT):
-    """Fetch market data from MEXC Futures API"""
+def send_telegram_alert(message):  # NEW FUNCTION
+    """Send trading alerts to Telegram with error handling"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        app.logger.warning("Telegram credentials missing - notifications disabled")
+        return False
+
     try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown"
+        }
+        response = requests.post(url, json=payload, timeout=10)
+        return response.status_code == 200
+    except Exception as e:
+        app.logger.error(f"Telegram send failed: {str(e)}")
+        return False
+
+def log_step(step, message, data=None, level='debug'):
+    """Structured logging with data sanitization"""
+    logger = getattr(app.logger, level)
+    log_msg = f"[{step}] {message}"
+    if data is not None:
+        sanitized = str(data).replace('\n', ' ')[:200]
+        log_msg += f" | Data: {sanitized}"
+    logger(log_msg)
+
+def get_futures_kline(symbol=DEFAULT_SYMBOL, interval=DEFAULT_INTERVAL, limit=DEFAULT_LIMIT):
+    """Fetch 1-minute market data with enhanced debugging"""
+    step = "DATA_FETCH"
+    try:
+        log_step(step, "Initiating API request", {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit
+        })
+        
         endpoint = f"{MEXC_FUTURES_BASE_URL}/kline/{symbol}"
         response = requests.get(endpoint, params={"interval": interval, "limit": limit}, timeout=15)
         response.raise_for_status()
+        
+        log_step(step, f"API response received - Status: {response.status_code}")
         data = response.json()
         
         if not data.get("success", False):
+            log_step(step, "API response indicates failure", data, 'error')
             return None
 
         raw_data = data.get("data", {})
+        if not raw_data.get("time"):
+            log_step(step, "Missing time data in response", raw_data, 'error')
+            return None
+
         df = pd.DataFrame({
             "timestamp": pd.to_datetime(raw_data["time"], unit='s', utc=True),
             "open": pd.to_numeric(raw_data["realOpen"], errors='coerce'),
@@ -76,14 +115,28 @@ def get_futures_kline(symbol=DEFAULT_SYMBOL, interval=DEFAULT_INTERVAL, limit=DE
             "close": pd.to_numeric(raw_data["realClose"], errors='coerce'),
             "volume": pd.to_numeric(raw_data["vol"], errors='coerce')
         })
-        return df.dropna().iloc[-250:]
+        
+        initial_count = len(df)
+        df = df.dropna().reset_index(drop=True)
+        log_step(step, f"Data cleaning complete - Remaining: {len(df)}/{initial_count} rows")
+        
+        if len(df) < 100:
+            log_step(step, "Insufficient data after cleaning", {"min_required": 100, "actual": len(df)}, 'error')
+            return None
+            
+        log_step(step, "Data sample", df.iloc[:3].to_dict('records'))
+        return df.iloc[-250:]
+
     except Exception as e:
-        app.logger.error(f"Data fetch error: {str(e)}")
+        log_step(step, f"Critical error: {str(e)}", traceback.format_exc(), 'error')
         return None
 
 def calculate_indicators(df):
-    """Calculate technical indicators"""
+    """Enhanced technical analysis with dynamic parameters"""
+    step = "INDICATOR_CALCULATION"
     try:
+        log_step(step, "Starting indicator calculation", {"input_shape": df.shape})
+        
         df["rsi"] = ta.rsi(df["close"], length=14)
         df["rsi_ma"] = df["rsi"].rolling(14).mean()
         df["ema_20"] = ta.ema(df["close"], length=20)
@@ -92,173 +145,284 @@ def calculate_indicators(df):
         bbands = ta.bbands(df["close"], length=20, std=2)
         df = pd.concat([df, bbands.add_prefix("bb_")], axis=1)
         df["bb_width"] = df["bb_BBU_20_2.0"] - df["bb_BBL_20_2.0"]
+        
         df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=14)
+        
         df["volume_ma"] = df["volume"].rolling(20).mean()
         df["volume_spike"] = (df["volume"] > 2.0 * df["volume_ma"]).astype(int)
+        
+        df["hour"] = df["timestamp"].dt.hour
+        df["session"] = np.select(
+            [
+                df["hour"].between(8, 11),
+                df["hour"].between(12, 15)
+            ],
+            ["morning", "afternoon"],
+            default="other"
+        )
+        
+        required_columns = [
+            'close', 'rsi', 'rsi_ma', 'ema_20', 'ema_50', 
+            'bb_BBU_20_2.0', 'bb_BBL_20_2.0', 'atr',
+            'volume_ma', 'volume_spike', 'hour'
+        ]
+        missing = [col for col in required_columns if col not in df.columns]
+        if missing:
+            log_step(step, f"Missing critical columns: {missing}", 'error')
+            return None
+            
+        log_step(step, "Indicator calculation successful", {
+            "final_shape": df.shape,
+            "columns": df.columns.tolist()
+        })
         return df.iloc[-100:]
+
     except Exception as e:
-        app.logger.error(f"Indicator error: {str(e)}")
+        log_step(step, f"Calculation failed: {str(e)}", traceback.format_exc(), 'error')
         return None
 
 def generate_signals(df):
-    """Generate trading signals"""
+    """Enhanced signal generation with dynamic thresholds"""
+    step = "SIGNAL_GENERATION"
     try:
+        log_step(step, "Starting signal generation")
         latest = df.iloc[-1]
         signals = []
         
-        # Bollinger Bands
-        if latest["close"] > latest["bb_BBU_20_2.0"]:
-            signals.append("BB Breakout")
-        elif latest["close"] < latest["bb_BBL_20_2.0"]:
-            signals.append("BB Breakdown")
+        price_change_5m = latest["close"] - df.iloc[-5]["close"]
+        change_pct = price_change_5m / df.iloc[-5]["close"]
+        signals.append(f"5m Change: {price_change_5m:+.2f} ({change_pct:.2%})")
+        
+        bb_upper = latest["bb_BBU_20_2.0"]
+        bb_lower = latest["bb_BBL_20_2.0"]
+        
+        if latest["close"] > bb_upper * 0.995:
+            signals.append(f"BB Approach Upper ({latest['close']:.2f} > {bb_upper*0.995:.2f})")
+        elif latest["close"] < bb_lower * 1.005:
+            signals.append(f"BB Approach Lower ({latest['close']:.2f} < {bb_lower*1.005:.2f})")
+        
+        trend_direction = 1 if latest["close"] > latest["ema_20"] else -1
+        rsi_buy_threshold = 40 + (5 * trend_direction)
+        rsi_sell_threshold = 60 + (5 * trend_direction)
+        
+        if latest["rsi"] < rsi_buy_threshold and latest["rsi"] > latest["rsi_ma"]:
+            signals.append(f"RSI Bullish ({latest['rsi']:.1f} < {rsi_buy_threshold})")
+        elif latest["rsi"] > rsi_sell_threshold and latest["rsi"] < latest["rsi_ma"]:
+            signals.append(f"RSI Bearish ({latest['rsi']:.1f} > {rsi_sell_threshold})")
             
-        # RSI Logic
-        if latest["rsi"] < 35:
-            signals.append("RSI Oversold")
-        elif latest["rsi"] > 65:
-            signals.append("RSI Overbought")
-            
-        # Volume Spike
+        volume_ratio = latest["volume"] / latest["volume_ma"]
         if latest["volume_spike"] == 1:
-            signals.append("Volume Spike")
+            signals.append(f"Strong Volume Spike ({volume_ratio:.1f}x MA)")
             
-        # ML Prediction
-        if model:
-            features = df[[
-                'rsi', 'close', 'bb_BBU_20_2.0', 'bb_BBL_20_2.0',
-                'volume_ma', 'atr'
-            ]].iloc[-1].values.reshape(1, -1)
-            prediction = model.predict(features)[0]
-            signals.append(f"ML Prediction: {'Bullish' if prediction == 1 else 'Bearish'}")
+        if latest["session"] == "morning" and latest["hour"] < 12:
+            signals.append("Morning Trend Potential")
+        elif latest["session"] == "afternoon" and latest["hour"] < 16:
+            signals.append("Afternoon Trend Potential")
             
+        if model is not None:
+            try:
+                features = df[[
+                    'rsi', 'close', 'bb_BBU_20_2.0', 'bb_BBL_20_2.0',
+                    'volume_ma', 'hour', 'atr'
+                ]].iloc[-1].values.reshape(1, -1)
+                prediction = model.predict(features)[0]
+                proba = model.predict_proba(features)[0]
+                confidence = max(proba)
+                signals.append(f"ML: {'Bullish' if prediction == 1 else 'Bearish'} ({confidence:.1%})")
+            except Exception as ml_error:
+                log_step(step, f"ML prediction failed: {str(ml_error)}", 'error')
+
+        log_step(step, f"Generated {len(signals)} signals", signals)
         return signals
+
     except Exception as e:
-        app.logger.error(f"Signal error: {str(e)}")
+        log_step(step, f"Signal generation failed: {str(e)}", traceback.format_exc(), 'error')
         return []
 
 def generate_trading_decision(signals, metrics):
-    """Generate trading decision with risk management"""
+    """Enhanced decision making with weighted confidence"""
     decision = {
         "action": "hold",
         "confidence": 0.0,
+        "signal_strength": {
+            "bullish": 0.0,
+            "bearish": 0.0,
+            "neutral": 0.0
+        },
+        "detailed_signals": [],
         "risk_parameters": {
             "stop_loss": None,
             "take_profit": None,
-            "position_size": TRADE_PARAMS["max_position_size"]
+            "position_size": TRADE_PARAMS["max_position_size"],
+            "risk_reward_ratio": TRADE_PARAMS["risk_reward_ratio"]
         }
     }
     
-    if not signals:
-        return decision
+    current_price = metrics["price"]
+    atr = metrics["atr"]
+    
+    for signal in signals:
+        decision["detailed_signals"].append(signal)
+        weight = 1.0
+        for key in SIGNAL_WEIGHTS:
+            if key in signal:
+                weight = SIGNAL_WEIGHTS[key]
+                break
+                
+        if any(kw in signal for kw in ["Bullish", "Upper", "Buy"]):
+            decision["signal_strength"]["bullish"] += weight
+        elif any(kw in signal for kw in ["Bearish", "Lower", "Sell"]):
+            decision["signal_strength"]["bearish"] += weight
+        else:
+            decision["signal_strength"]["neutral"] += weight
+
+    total_strength = sum(decision["signal_strength"].values())
+    if total_strength > 0:
+        rsi_factor = 1 - abs(metrics["rsi"] - 50)/50
+        raw_confidence = max(
+            decision["signal_strength"]["bullish"],
+            decision["signal_strength"]["bearish"]
+        ) / total_strength
         
-    # Simplified decision logic
-    bullish = sum(1 for s in signals if "Breakout" in s or "Oversold" in s or "Bullish" in s)
-    bearish = sum(1 for s in signals if "Breakdown" in s or "Overbought" in s or "Bearish" in s)
-    
-    confidence = min(100 * (abs(bullish - bearish) / len(signals)), 100)
-    
-    if bullish > bearish and confidence >= 55:
-        decision.update({
-            "action": "long",
-            "confidence": round(confidence, 1),
-            "risk_parameters": {
-                "stop_loss": metrics["price"] * (1 - TRADE_PARAMS["stop_loss_pct"]/100),
-                "take_profit": metrics["price"] * (1 + TRADE_PARAMS["take_profit_pct"]/100),
-                "position_size": TRADE_PARAMS["max_position_size"] * confidence/100
-            }
-        })
-    elif bearish > bullish and confidence >= 55:
-        decision.update({
-            "action": "short",
-            "confidence": round(confidence, 1),
-            "risk_parameters": {
-                "stop_loss": metrics["price"] * (1 + TRADE_PARAMS["stop_loss_pct"]/100),
-                "take_profit": metrics["price"] * (1 - TRADE_PARAMS["take_profit_pct"]/100),
-                "position_size": TRADE_PARAMS["max_position_size"] * confidence/100
-            }
-        })
-    
+        decision["confidence"] = round((raw_confidence * 0.7 + rsi_factor * 0.3) * 100, 1)
+        
+        if decision["signal_strength"]["bullish"] > decision["signal_strength"]["bearish"]:
+            if decision["confidence"] >= 55:
+                decision["action"] = "long"
+                decision["risk_parameters"]["stop_loss"] = round(current_price - atr * 1.2, 2)
+                decision["risk_parameters"]["take_profit"] = round(current_price + atr * TRADE_PARAMS["risk_reward_ratio"], 2)
+        elif decision["signal_strength"]["bearish"] > decision["signal_strength"]["bullish"]:
+            if decision["confidence"] >= 55:
+                decision["action"] = "short"
+                decision["risk_parameters"]["stop_loss"] = round(current_price + atr * 1.2, 2)
+                decision["risk_parameters"]["take_profit"] = round(current_price - atr * TRADE_PARAMS["risk_reward_ratio"], 2)
+
+    if decision["action"] != "hold":
+        volatility_ratio = atr / current_price
+        confidence_factor = decision["confidence"] / 100
+        decision["risk_parameters"]["position_size"] = round(
+            TRADE_PARAMS["max_position_size"] * confidence_factor * (1 - min(volatility_ratio, 0.3)),
+            4
+        )
+
     return decision
 
-# ====================== API ENDPOINTS ====================== #
 @app.route("/")
 def trading_dashboard():
-    """Main trading endpoint"""
+    """Main trading endpoint with full metrics"""
     try:
+        log_step("SYSTEM", "Processing pipeline started")
+        
         raw_data = get_futures_kline()
         if raw_data is None:
-            return jsonify({"status": "error", "message": "Data fetch failed"}), 500
-            
+            return jsonify({
+                "status": "error",
+                "stage": "data_fetch",
+                "message": "Failed to retrieve market data",
+                "advice": ["Check API status", "Verify symbol/interval"]
+            }), 503
+
         processed_data = calculate_indicators(raw_data)
         if processed_data is None:
-            return jsonify({"status": "error", "message": "Processing failed"}), 500
-            
-        latest = processed_data.iloc[-1]
+            return jsonify({
+                "status": "error",
+                "stage": "indicators",
+                "data_stats": {
+                    "initial_rows": len(raw_data),
+                    "columns": raw_data.columns.tolist(),
+                    "last_timestamp": raw_data["timestamp"].iloc[-1].isoformat()
+                }
+            }), 500
+
         signals = generate_signals(processed_data)
-        
-        return jsonify({
-            "status": "success",
-            "symbol": DEFAULT_SYMBOL,
+        latest = processed_data.iloc[-1]
+        metrics = {
             "price": latest["close"],
-            "signals": signals,
-            "decision": generate_trading_decision(signals, {
-                "price": latest["close"],
-                "rsi": latest["rsi"],
-                "atr": latest["atr"]
-            }),
-            "timestamp": datetime.utcnow().isoformat()
-        })
+            "rsi": latest["rsi"],
+            "rsi_ma": latest["rsi_ma"],
+            "ema_20": latest["ema_20"],
+            "ema_50": latest["ema_50"],
+            "bb_upper": latest["bb_BBU_20_2.0"],
+            "bb_lower": latest["bb_BBL_20_2.0"],
+            "atr": latest["atr"],
+            "volume": latest["volume"],
+            "volume_ma": latest["volume_ma"],
+            "volume_spike": bool(latest["volume_spike"]),
+            "session": latest["session"],
+            "hour": int(latest["hour"])
+        }
+
+        response_data = {
+            "status": "success",
+            "decision": generate_trading_decision(signals, metrics),
+            "metrics": metrics,
+            "context": {
+                "interval": DEFAULT_INTERVAL,
+                "symbol": DEFAULT_SYMBOL,
+                "model_active": model is not None
+            }
+        }
+
+        # Telegram notification logic  # NEW
+        if response_data["decision"]["action"] != "hold":
+            message = (
+                f"🚨 *{DEFAULT_SYMBOL} Trade Signal* 🚨\n"
+                f"Action: {response_data['decision']['action'].upper()}\n"
+                f"Confidence: {response_data['decision']['confidence']}%\n"
+                f"Price: {metrics['price']}\n"
+                f"SL: {response_data['decision']['risk_parameters']['stop_loss']}\n"
+                f"TP: {response_data['decision']['risk_parameters']['take_profit']}\n"
+                f"RSI: {metrics['rsi']:.1f}\n"
+                f"Volume: {metrics['volume']}"
+            )
+            send_telegram_alert(message)
+
+        return jsonify(response_data)
+
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        log_step("SYSTEM", f"Unhandled exception: {str(e)}", traceback.format_exc(), 'error')
+        return jsonify({
+            "status": "error",
+            "message": "System failure",
+            "error_details": str(e)[:200]
+        }), 500
+
+def scheduled_update():  # NEW FUNCTION
+    """Send regular status updates to Telegram"""
+    with app.app_context():
+        app.logger.info("Running scheduled update")
+        try:
+            client = app.test_client()
+            response = client.get('/')
+            
+            if response.status_code == 200:
+                data = response.json
+                message = (
+                    f"⏰ *{DEFAULT_SYMBOL} Status Update*\n"
+                    f"Price: {data['metrics']['price']}\n"
+                    f"RSI: {data['metrics']['rsi']:.1f}\n"
+                    f"Volume: {data['metrics']['volume']}\n"
+                    f"Current Action: {data['decision']['action'].upper()}"
+                )
+                send_telegram_alert(message)
+                
+        except Exception as e:
+            app.logger.error(f"Scheduled update failed: {str(e)}")
 
 @app.route("/health")
 def health_check():
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
-        "environment": os.getenv("RAILWAY_ENVIRONMENT", "development")
+        "system": {
+            "python_version": os.sys.version,
+            "platform": os.sys.platform
+        }
     })
 
-# ====================== SCHEDULED TASKS ====================== #
-def forced_update():
-    """Send regular updates to Telegram"""
-    try:
-        raw_data = get_futures_kline()
-        processed_data = calculate_indicators(raw_data)
-        latest = processed_data.iloc[-1]
-        
-        message = (
-            f"📊 {DEFAULT_SYMBOL} Update\n"
-            f"Price: {latest['close']:.2f}\n"
-            f"RSI: {latest['rsi']:.1f}\n"
-            f"24h Change: {(latest['close'] - processed_data.iloc[0]['close']):.2f}"
-        )
-        send_telegram_alert(message)
-    except Exception as e:
-        app.logger.error(f"Scheduled update failed: {str(e)}")
-
-def send_telegram_alert(message):
-    """Send message to Telegram"""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "parse_mode": "Markdown"
-            },
-            timeout=5
-        )
-    except Exception as e:
-        app.logger.error(f"Telegram send failed: {str(e)}")
-
-# ====================== INITIALIZATION ====================== #
 if __name__ == "__main__":
-    scheduler.add_job(forced_update, 'interval', minutes=5)
+    # Initialize scheduler  # NEW
+    scheduler.add_job(scheduled_update, 'interval', minutes=5)
     scheduler.start()
     
-    port = int(os.getenv("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
