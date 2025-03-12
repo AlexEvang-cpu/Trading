@@ -426,3 +426,46 @@ if __name__ == "__main__":
     scheduler.start()
     
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+# ====================== ADD THIS FUNCTION ====================== #
+def send_full_indicators():
+    """Send complete technical analysis snapshot to Telegram"""
+    try:
+        raw_data = get_futures_kline()
+        if raw_data is None:
+            return
+
+        processed_data = calculate_indicators(raw_data)
+        if processed_data is None:
+            return
+
+        latest = processed_data.iloc[-1]
+        
+        # Format indicator message
+        message = (
+            f"📊 *{DEFAULT_SYMBOL} Technical Snapshot* 📊\n"
+            f"⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+            f"• Price: ${latest['close']:.2f}\n"
+            f"• 5m Change: {(latest['close'] - processed_data.iloc[-5]['close']):+.2f}\n"
+            f"• RSI: {latest['rsi']:.1f} / MA: {latest['rsi_ma']:.1f}\n"
+            f"• EMA20/50: {latest['ema_20']:.2f} | {latest['ema_50']:.2f}\n"
+            f"• BB Width: {latest['bb_width']:.2f} (U: {latest['bb_BBU_20_2.0']:.2f} L: {latest['bb_BBL_20_2.0']:.2f})\n"
+            f"• ATR: {latest['atr']:.2f}\n"
+            f"• Volume: {latest['volume']:,.0f} (MA: {latest['volume_ma']:,.0f})\n"
+            f"• Session: {latest['session'].title()} (Hour {latest['hour']})"
+        )
+        
+        send_telegram_alert(message)
+
+    except Exception as e:
+        app.logger.error(f"Indicator report failed: {str(e)}")
+
+# ================== MODIFY SCHEDULER SETUP ================== #
+if __name__ == "__main__":
+    # Existing jobs
+    scheduler.add_job(scheduled_update, 'interval', minutes=5)
+    
+    # Add new indicator report
+    scheduler.add_job(send_full_indicators, 'interval', minutes=5, id='full_indicators')
+    
+    scheduler.start()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
