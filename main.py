@@ -420,13 +420,6 @@ def health_check():
         }
     })
 
-if __name__ == "__main__":
-    # Initialize scheduler  # NEW
-    scheduler.add_job(scheduled_update, 'interval', minutes=5)
-    scheduler.start()
-    
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
-# ====================== ADD THIS FUNCTION ====================== #
 def send_full_indicators():
     """Send complete technical analysis snapshot to Telegram"""
     try:
@@ -459,13 +452,10 @@ def send_full_indicators():
     except Exception as e:
         app.logger.error(f"Indicator report failed: {str(e)}")
 
-# ================== MODIFY SCHEDULER SETUP ================== #
 if __name__ == "__main__":
-    # Existing jobs
+    # Initialize all scheduled jobs in one block
     scheduler.add_job(scheduled_update, 'interval', minutes=5)
-    
-    # Add new indicator report
-    scheduler.add_job(send_full_indicators, 'interval', minutes=5, id='full_indicators')
-    
+    scheduler.add_job(send_full_indicators, 'interval', minutes=5)
     scheduler.start()
+    
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
