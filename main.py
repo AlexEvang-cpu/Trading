@@ -387,27 +387,24 @@ def trading_dashboard():
             "error_details": str(e)[:200]
         }), 500
 
-def scheduled_update():  # NEW FUNCTION
-    """Send regular status updates to Telegram"""
-    with app.app_context():
-        app.logger.info("Running scheduled update")
-        try:
-            client = app.test_client()
-            response = client.get('/')
-            
-            if response.status_code == 200:
-                data = response.json
-                message = (
-                    f"⏰ *{DEFAULT_SYMBOL} Status Update*\n"
-                    f"Price: {data['metrics']['price']}\n"
-                    f"RSI: {data['metrics']['rsi']:.1f}\n"
-                    f"Volume: {data['metrics']['volume']}\n"
-                    f"Current Action: {data['decision']['action'].upper()}"
-                )
-                send_telegram_alert(message)
-                
-        except Exception as e:
-            app.logger.error(f"Scheduled update failed: {str(e)}")
+def scheduled_update():
+    """Direct data fetch without HTTP client"""
+    try:
+        raw_data = get_futures_kline()
+        processed_data = calculate_indicators(raw_data)
+        latest = processed_data.iloc[-1]
+        
+        message = (
+            f"⏰ *{DEFAULT_SYMBOL} Status Update*\n"
+            f"Price: {latest['close']}\n"
+            f"RSI: {latest['rsi']:.1f}\n"
+            f"Volume: {latest['volume']}\n"
+            f"Session: {latest['session'].title()}"
+        )
+        send_telegram_alert(message)
+        
+    except Exception as e:
+        app.logger.error(f"Scheduled update error: {str(e)}")
 
 @app.route("/health")
 def health_check():
@@ -452,10 +449,17 @@ def send_full_indicators():
     except Exception as e:
         app.logger.error(f"Indicator report failed: {str(e)}")
 
+# Add at the BOTTOM of your code (last 10 lines)
+def initialize_scheduler():
+    """Safe scheduler initialization for production"""
+    if os.environ.get("WERKZEUG_RUN_MAIN") != "true" and not app.debug:
+        scheduler.add_job(scheduled_update, 'interval', minutes=5)
+        scheduler.add_job(send_full_indicators, 'interval', minutes=5)
+        scheduler.start()
+        app.logger.info("Scheduler started with 2 jobs")
+
 if __name__ == "__main__":
-    # Initialize all scheduled jobs in one block
-    scheduler.add_job(scheduled_update, 'interval', minutes=5)
-    scheduler.add_job(send_full_indicators, 'interval', minutes=5)
-    scheduler.start()
-    
+    initialize_scheduler()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+else:
+    initialize_scheduler()  # For production environments like Railway
